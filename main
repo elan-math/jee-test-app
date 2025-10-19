@@ -1,1 +1,1 @@
-
+npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --use-npm --no-import-alias
