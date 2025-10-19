@@ -32,69 +32,40 @@ type ReportData = {
   totalIncorrect: number;
   totalUnattempted: number;
   subjectStats: {
-    PHYSICS: SubjectStats;
-    CHEMISTRY: SubjectStats;
-    MATH: SubjectStats;
+    [key: string]: SubjectStats; // Use a dynamic key for subjects
   };
   questions: QuestionAnalysis[];
 }
 
 type ReportTab = 'ALL' | 'CORRECT' | 'INCORRECT' | 'UNATTEMPTED'
 
-
-
-// --- Helper Function for Answer Comparison (FINAL, ROBUST) ---
+// --- Helper Function for Answer Comparison (ROBUST) ---
 function isAnswerCorrect(qType: string, selected: any, correct: any): boolean {
-  // 1. If no answer was selected, it's incorrect.
-  // This now checks for null, undefined, and empty string.
   if (selected === null || selected === undefined || selected === "") {
     return false;
   }
-  
-  // 2. If no correct answer is defined in the database, it's incorrect.
   if (!Array.isArray(correct) || correct.length === 0) {
     return false;
   }
-
-  // Use a try...catch, as data-type conversions can fail.
   try {
-    const correctAnswer = correct[0]; // Get the "A" from ["A"] or 10 from [10]
-
-    // 3. For SINGLE_CHOICE:
+    const correctAnswer = correct[0];
     if (qType === 'SINGLE_CHOICE') {
-      // Compare both as strings. "A" === "A"
       return String(selected) === String(correctAnswer);
     }
-    
-    // 4. For NUMERICAL:
     if (qType === 'NUMERICAL') {
-      // Convert both to floating-point numbers.
-      // parseFloat("10") -> 10.0
-      // parseFloat(10) -> 10.0
       const selectedNum = parseFloat(selected);
       const correctNum = parseFloat(correctAnswer);
-      
-      // If either is not a valid number (e.g., user entered "abc"), it's wrong.
       if (Number.isNaN(selectedNum) || Number.isNaN(correctNum)) {
         return false;
       }
-      
-      // Compare the numbers with a small tolerance for floating-point errors.
       return Math.abs(correctNum - selectedNum) < 0.01;
     }
-
   } catch (e) {
-    // If anything breaks during conversion, log it and mark as incorrect.
     console.error("Error comparing answers:", e, { selected, correct });
     return false;
   }
-
-  // 5. If the question type is not one we handle (e.g., MULTI_CHOICE),
-  // mark as incorrect for now.
   return false;
 }
-
-
 
 // --- The Main Report Page Component ---
 export default function ReportPage() {
@@ -114,31 +85,32 @@ export default function ReportPage() {
 
     const generateReport = async () => {
       try {
-        // 1. Get the user (for security)
         const { data: { user } } = await supabase.auth.getUser()
         if (!user) {
           router.push('/login')
           return
         }
 
-        // 2. Fetch the Attempt + Test Name
+        // Fetch attempt and joined Test data
         const { data: attemptData, error: attemptError } = await supabase
           .from('User_Test_Attempts')
-          .select('test_id, user_id, final_score, Tests(name)')
+          .select('test_id, user_id, Tests(*)')
           .eq('attempt_id', attemptId)
+          .eq('user_id', user.id)
           .single()
 
-        if (attemptError) throw new Error(`Attempt not found. ${attemptError.message}`)
-        if (attemptData.user_id !== user.id) throw new Error('You do not have permission to view this report.')
+        if (attemptError) throw new Error(`Attempt not found or permission denied. ${attemptError.message}`)
 
         const testId = attemptData.test_id
         
-        // --- FIX 1: Access the test name from the first element of the array ---
-        const testName = (attemptData.Tests && Array.isArray(attemptData.Tests) && attemptData.Tests.length > 0)
-          ? attemptData.Tests[0].name
-          : 'Test Report'
+        // Handle Supabase join result (can be object or array)
+        // Fix for Tests(name) returning an array
+        const testDetails = attemptData.Tests;
+        const testName = (testDetails && Array.isArray(testDetails) && testDetails.length > 0)
+          ? testDetails[0].name
+          : 'Test Report';
 
-        // 3. Fetch all User's Answers
+        // Fetch all User's Answers for this attempt
         const { data: userAnswers, error: answersError } = await supabase
           .from('User_Answer_Responses')
           .select('question_id, selected_answer')
@@ -151,7 +123,7 @@ export default function ReportPage() {
           answerMap.set(ans.question_id, ans.selected_answer)
         })
 
-        // 4. Fetch all Questions + Solutions
+        // Fetch all Questions + Solutions for this test
         const { data: questionLinks, error: questionsError } = await supabase
           .from('Test_Questions_Link')
           .select('question_number, Questions(*)')
@@ -160,44 +132,33 @@ export default function ReportPage() {
         
         if (questionsError) throw new Error(`Could not fetch questions. ${questionsError.message}`)
 
-        // 5. --- Calculate Score ---
+        // --- Calculate Score ---
         const newReportData: ReportData = {
           testName,
           totalScore: 0,
           totalCorrect: 0,
           totalIncorrect: 0,
           totalUnattempted: 0,
-          subjectStats: {
-            PHYSICS: { correct: 0, incorrect: 0, unattempted: 0, score: 0 },
-            CHEMISTRY: { correct: 0, incorrect: 0, unattempted: 0, score: 0 },
-            MATH: { correct: 0, incorrect: 0, unattempted: 0, score: 0 },
-          },
+          subjectStats: {}, // Initialize as empty
           questions: [],
         }
 
         for (const link of questionLinks) {
-          // --- FIX 2: Check if Questions is an array and get the first element ---
-          if (!link.Questions || !Array.isArray(link.Questions) || link.Questions.length === 0) {
-            continue // Skip if the joined question data is missing
-          }
-          const q = link.Questions[0] // Get the question object from the array
-          // --- All subsequent 'q.' access will now work ---
-          
+          // Handle Supabase join result (can be object or array)
+          const q = (link.Questions && !Array.isArray(link.Questions)) ? link.Questions : null;
           if (!q) continue
 
           const question_id = q.question_id
           const selected_answer = answerMap.get(question_id) || null
-          // Handle potential null subject
-          const subject = (q.subject || 'UNCATEGORIZED').toUpperCase() as ('PHYSICS' | 'CHEMISTRY' | 'MATH' | 'UNCATEGORIZED')
+          const subject = (q.subject || 'UNCATEGORIZED').toUpperCase()
           
-          // Ensure subject exists in our stats object
           if (!newReportData.subjectStats[subject]) {
              newReportData.subjectStats[subject] = { correct: 0, incorrect: 0, unattempted: 0, score: 0 }
           }
           
           let status: 'CORRECT' | 'INCORRECT' | 'UNATTEMPTED'
           
-          if (selected_answer === null) {
+          if (selected_answer === null || selected_answer === "") {
             status = 'UNATTEMPTED'
             newReportData.totalUnattempted++
             newReportData.subjectStats[subject].unattempted++
@@ -224,9 +185,11 @@ export default function ReportPage() {
         }
         
         // Calculate scores
-        // Use the score calculated by the server!
-        newReportData.totalScore = attemptData.final_score ?? (newReportData.totalCorrect * 4) - (newReportData.totalIncorrect * 1)
-        
+        newReportData.totalScore = (newReportData.totalCorrect * 4) - (newReportData.totalIncorrect * 1)
+        for (const sub of Object.keys(newReportData.subjectStats)) {
+          const stats = newReportData.subjectStats[sub]
+          stats.score = (stats.correct * 4) - (stats.incorrect * 1)
+        }
 
         setReportData(newReportData)
 
@@ -240,8 +203,8 @@ export default function ReportPage() {
     generateReport()
   }, [attemptId, supabase, router])
 
-  // --- Render Logic ---
-
+  // --- Render Logic (unchanged) ---
+  // ... (The entire return (...) section is the same as before) ...
   if (loading) {
     return (
       <div className="flex flex-col justify-center items-center min-h-screen">
@@ -376,8 +339,7 @@ function QuestionReviewCard({ question }: { question: QuestionAnalysis }) {
   const [showSolution, setShowSolution] = useState(false)
 
   const getAnswerDisplay = (answer: any) => {
-    if (answer === null || answer === undefined) return 'Not Answered'
-    // Handle numerical "10.0" vs "10"
+    if (answer === null || answer === undefined || answer === "") return 'Not Answered'
     if (typeof answer === 'number' || !isNaN(parseFloat(answer))) {
         return String(parseFloat(answer))
     }
@@ -388,7 +350,6 @@ function QuestionReviewCard({ question }: { question: QuestionAnalysis }) {
   const getCorrectAnswerDisplay = (answer: any) => {
     if (answer === null || answer === undefined) return 'N/A'
     if (Array.isArray(answer)) {
-        // map over array to handle numericals
         return answer.map(a => getAnswerDisplay(a)).join(', ')
     }
     return getAnswerDisplay(answer)

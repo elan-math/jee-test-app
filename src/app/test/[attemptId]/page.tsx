@@ -1,416 +1,450 @@
-// src/app/report/[attemptId]/page.tsx
+// src/app/test/[attemptId]/page.tsx
 'use client'
 
-import { useEffect, useState } from 'react'
-import { useParams, useRouter } from 'next/navigation'
+import { useEffect, useState, useRef } from 'react'
+import { useRouter, useParams } from 'next/navigation'
 import { createClient } from '../../../lib/supabaseClient'
 import Spinner from '../../../components/Spinner'
 
-// --- Types for Report Data ---
-type QuestionAnalysis = {
+// --- Types ---
+type Question = {
   question_id: string;
-  question_number: number;
   question_text: string | null;
-  subject: string;
-  correct_answer: any;
-  solution_text: string | null;
+  question_image_url: string | null;
+  question_type: string;
+  options: { id: string; text: string }[] | null;
+  question_number: number;
+}
+
+type AnswerStatus = 'not_visited' | 'unanswered' | 'answered' | 'marked_for_review'
+
+type QuestionState = {
+  status: AnswerStatus;
   selected_answer: any | null;
-  status: 'CORRECT' | 'INCORRECT' | 'UNATTEMPTED';
+  time_taken_sec: number;
 }
 
-type SubjectStats = {
-  correct: number;
-  incorrect: number;
-  unattempted: number;
-  score: number;
+type TestState = {
+  [question_id: string]: QuestionState;
 }
 
-type ReportData = {
-  testName: string;
-  totalScore: number;
-  totalCorrect: number;
-  totalIncorrect: number;
-  totalUnattempted: number;
-  subjectStats: {
-    [key: string]: SubjectStats; // Use a dynamic key for subjects
-  };
-  questions: QuestionAnalysis[];
-}
-
-type ReportTab = 'ALL' | 'CORRECT' | 'INCORRECT' | 'UNATTEMPTED'
-
-// --- Helper Function for Answer Comparison (ROBUST) ---
-function isAnswerCorrect(qType: string, selected: any, correct: any): boolean {
-  // 1. If no answer was selected, it's incorrect.
-  if (selected === null || selected === undefined || selected === "") {
-    return false;
-  }
-  
-  // 2. If no correct answer is defined, it's incorrect.
-  if (!Array.isArray(correct) || correct.length === 0) {
-    return false;
-  }
-
-  try {
-    const correctAnswer = correct[0]; // Get the "A" from ["A"] or 10 from [10]
-
-    // 3. For SINGLE_CHOICE:
-    if (qType === 'SINGLE_CHOICE') {
-      return String(selected) === String(correctAnswer);
-    }
-    
-    // 4. For NUMERICAL:
-    if (qType === 'NUMERICAL') {
-      const selectedNum = parseFloat(selected);
-      const correctNum = parseFloat(correctAnswer);
-      
-      if (Number.isNaN(selectedNum) || Number.isNaN(correctNum)) {
-        return false;
-      }
-      
-      return Math.abs(correctNum - selectedNum) < 0.01;
-    }
-
-  } catch (e) {
-    console.error("Error comparing answers:", e, { selected, correct });
-    return false;
-  }
-  return false;
-}
-
-
-// --- The Main Report Page Component ---
-export default function ReportPage() {
+// --- The Main Test Page Component ---
+export default function TestPage() {
+  // --- FIX: All declarations must be at the top ---
   const supabase = createClient()
   const router = useRouter()
   const params = useParams()
-  const attemptId = params.attemptId as string
+  const attemptId = params.attemptId as string // <-- This was at line 141, now it's here
 
+  // --- State Variables ---
+  const [questions, setQuestions] = useState<Question[]>([])
+  const [testDuration, setTestDuration] = useState(180) 
+  const [timeLeft, setTimeLeft] = useState(180 * 60) 
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0)
+  const [testState, setTestState] = useState<TestState>({})
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [reportData, setReportData] = useState<ReportData | null>(null)
-  const [activeTab, setActiveTab] = useState<ReportTab>('ALL')
+  const [isSubmitting, setIsSubmitting] = useState(false)
 
-  // --- Data Fetching and Calculation Effect ---
+  // Use a Ref to track state for background saves
+  const testStateRef = useRef(testState)
   useEffect(() => {
-    if (!attemptId) return
+    testStateRef.current = testState
+  }, [testState])
 
-    const generateReport = async () => {
-      try {
-        // 1. Get the user (for security)
-        const { data: { user } } = await supabase.auth.getUser()
-        if (!user) {
-          router.push('/login')
-          return
-        }
 
-        // 2. Fetch the Attempt + Test Name
-        const { data: attemptData, error: attemptError } = await supabase
-          .from('User_Test_Attempts')
-          .select('test_id, user_id, Tests(name)')
-          .eq('attempt_id', attemptId)
-          .single()
+  // --- Helper Function ---
+  const getQuestionState = (qId: string): QuestionState => {
+    return testState[qId] || {
+      status: 'not_visited',
+      selected_answer: null,
+      time_taken_sec: 0,
+    }
+  }
 
-        if (attemptError) throw new Error(`Attempt not found. ${attemptError.message}`)
-        if (attemptData.user_id !== user.id) throw new Error('You do not have permission to view this report.')
+  // --- 1. Data Fetching Effect (Runs once) ---
+  useEffect(() => {
+    if (!attemptId) return // <-- This is line 64, which now works
 
-        const testId = attemptData.test_id
-        
-        // Fix for Supabase array join
-        const testName = (attemptData.Tests && Array.isArray(attemptData.Tests) && attemptData.Tests.length > 0)
-          ? attemptData.Tests[0].name
-          : 'Test Report'
-
-        // 3. Fetch all User's Answers
-        const { data: userAnswers, error: answersError } = await supabase
-          .from('User_Answer_Responses')
-          .select('question_id, selected_answer')
-          .eq('attempt_id', attemptId)
-        
-        if (answersError) throw new Error(`Could not fetch answers. ${answersError.message}`)
-        
-        const answerMap = new Map<string, any>()
-        userAnswers.forEach(ans => {
-          answerMap.set(ans.question_id, ans.selected_answer)
-        })
-
-        // 4. Fetch all Questions + Solutions
-        const { data: questionLinks, error: questionsError } = await supabase
-          .from('Test_Questions_Link')
-          .select('question_number, Questions(*)')
-          .eq('test_id', testId)
-          .order('question_number', { ascending: true })
-        
-        if (questionsError) throw new Error(`Could not fetch questions. ${questionsError.message}`)
-
-        // 5. --- Calculate Score ---
-        const newReportData: ReportData = {
-          testName,
-          totalScore: 0,
-          totalCorrect: 0,
-          totalIncorrect: 0,
-          totalUnattempted: 0,
-          subjectStats: {}, // Initialize as empty object
-          questions: [],
-        }
-
-        for (const link of questionLinks) {
-          // Fix for Supabase array join
-          if (!link.Questions || !Array.isArray(link.Questions) || link.Questions.length === 0) {
-            continue 
-          }
-          const q = link.Questions[0] 
-          
-          if (!q) continue
-
-          const question_id = q.question_id
-          const selected_answer = answerMap.get(question_id) || null
-          const subject = (q.subject || 'UNCATEGORIZED').toUpperCase()
-          
-          // Dynamically create subject stats if they don't exist
-          if (!newReportData.subjectStats[subject]) {
-             newReportData.subjectStats[subject] = { correct: 0, incorrect: 0, unattempted: 0, score: 0 }
-          }
-          
-          let status: 'CORRECT' | 'INCORRECT' | 'UNATTEMPTED'
-          
-          if (selected_answer === null || selected_answer === "") {
-            status = 'UNATTEMPTED'
-            newReportData.totalUnattempted++
-            newReportData.subjectStats[subject].unattempted++
-          } else if (isAnswerCorrect(q.question_type, selected_answer, q.correct_answer)) {
-            status = 'CORRECT'
-            newReportData.totalCorrect++
-            newReportData.subjectStats[subject].correct++
-          } else {
-            status = 'INCORRECT'
-            newReportData.totalIncorrect++
-            newReportData.subjectStats[subject].incorrect++
-          }
-
-          newReportData.questions.push({
-            question_id,
-            question_number: link.question_number,
-            question_text: q.question_text,
-            subject: q.subject,
-            correct_answer: q.correct_answer,
-            solution_text: q.solution_text,
-            selected_answer: selected_answer,
-            status: status,
-          })
-        }
-        
-        // Calculate scores
-        newReportData.totalScore = (newReportData.totalCorrect * 4) - (newReportData.totalIncorrect * 1)
-        for (const sub of Object.keys(newReportData.subjectStats)) {
-          const stats = newReportData.subjectStats[sub]
-          stats.score = (stats.correct * 4) - (stats.incorrect * 1)
-        }
-
-        setReportData(newReportData)
-
-      } catch (err: any) {
-        setError(err.message)
-      } finally {
-        setLoading(false)
+    const fetchTestData = async () => {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+      if (sessionError || !session) {
+        router.push('/login')
+        return
       }
+
+      // Fetch attempt and joined Test data
+      const { data: attemptData, error: attemptError } = await supabase
+        .from('User_Test_Attempts')
+        .select('test_id, user_id, Tests(duration_minutes)') // Select joined data
+        .eq('attempt_id', attemptId)
+        .eq('user_id', session.user.id) 
+        .single()
+
+      if (attemptError || !attemptData) {
+        alert('Could not load test. Invalid attempt ID.')
+        router.push('/dashboard')
+        return
+      }
+      
+      // FIX: Handle Tests(duration_minutes) returning an array
+      const testDetails = attemptData.Tests;
+      const duration = (testDetails && Array.isArray(testDetails) && testDetails.length > 0)
+        ? testDetails[0].duration_minutes
+        : 180;
+      
+      setTestDuration(duration)
+      setTimeLeft(duration * 60) 
+
+      // Fetch questions and joined Question data
+      const { data: questionLinks, error: questionsError } = await supabase
+        .from('Test_Questions_Link')
+        .select('question_number, Questions(*)') // Select all from joined Questions
+        .eq('test_id', attemptData.test_id)
+        .order('question_number', { ascending: true })
+
+      if (questionsError || !questionLinks) {
+        alert('Could not load test questions.')
+        return
+      }
+      
+      // FIX: Handle Questions(*) returning an object
+      const fetchedQuestions: Question[] = questionLinks.map(link => {
+         const qData = (link.Questions && !Array.isArray(link.Questions)) ? link.Questions : null;
+         return {
+            ...qData,
+            question_id: qData?.question_id || '',
+            question_number: link.question_number,
+         } as Question
+      }).filter(q => q.question_id); // Filter out any nulls
+      
+      setQuestions(fetchedQuestions)
+
+      const initialState: TestState = {}
+      fetchedQuestions.forEach(q => {
+        initialState[q.question_id] = {
+          status: 'not_visited',
+          selected_answer: null,
+          time_taken_sec: 0,
+        }
+      })
+      
+      if (fetchedQuestions.length > 0) {
+        initialState[fetchedQuestions[0].question_id].status = 'unanswered'
+      }
+
+      setTestState(initialState)
+      testStateRef.current = initialState
+      setLoading(false)
     }
 
-    generateReport()
-  }, [attemptId, supabase, router])
+    fetchTestData()
+  }, [attemptId, supabase, router]) // attemptId is now correctly in scope
 
+  // --- 2. Timer Effect ---
+  useEffect(() => {
+    if (loading || isSubmitting) return 
+    if (timeLeft <= 0) {
+      handleSubmitTest()
+      return
+    }
+    const timerInterval = setInterval(() => {
+      setTimeLeft((prevTime) => prevTime - 1)
+    }, 1000)
+    return () => clearInterval(timerInterval)
+  }, [timeLeft, loading, isSubmitting])
+  
+  // --- 3. Save Answer Function (CORRECTED) ---
+  const saveAnswerToDB = async (qId: string) => {
+    const stateToSave = testStateRef.current[qId]
+    if (!stateToSave) return 
+
+    let dbAction = stateToSave.status;
+    if (dbAction === 'not_visited') {
+      dbAction = 'unanswered';
+    }
+
+    const { error } = await supabase
+      .from('User_Answer_Responses')
+      .upsert({
+        attempt_id: attemptId,
+        question_id: qId,
+        selected_answer: stateToSave.selected_answer,
+        action: dbAction // <-- Saves the correct action
+      }, {
+        onConflict: 'attempt_id, question_id' 
+      })
+
+    if (error) {
+      console.error('Failed to save answer:', error)
+    }
+  }
+
+  // --- 4. Navigation Function ---
+  const navigateToQuestion = (newIndex: number) => {
+    if (newIndex < 0 || newIndex >= questions.length || newIndex === currentQuestionIndex) {
+      return
+    }
+
+    const oldQId = questions[currentQuestionIndex].question_id
+    saveAnswerToDB(oldQId) 
+    
+    const newQId = questions[newIndex].question_id
+    const newState = getQuestionState(newQId) 
+    
+    if (newState.status === 'not_visited') {
+      setTestState(prevState => ({
+        ...prevState,
+        [newQId]: {
+          ...newState,
+          status: 'unanswered',
+        }
+      }))
+    }
+    
+    setCurrentQuestionIndex(newIndex)
+  }
+
+  // --- Event Handlers (CORRECTED with prevState) ---
+
+  const handleSaveAndNext = () => {
+    navigateToQuestion(currentQuestionIndex + 1)
+  }
+
+  const handleMarkForReview = () => {
+    const qId = questions[currentQuestionIndex].question_id
+    setTestState(prevState => {
+      const oldQState = prevState[qId] || getQuestionState(qId);
+      return {
+        ...prevState,
+        [qId]: {
+          ...oldQState,
+          status: 'marked_for_review',
+        }
+      }
+    })
+    navigateToQuestion(currentQuestionIndex + 1)
+  }
+
+  const handleClearResponse = () => {
+    const qId = questions[currentQuestionIndex].question_id
+    setTestState(prevState => {
+      const oldQState = prevState[qId] || getQuestionState(qId);
+      return {
+        ...prevState,
+        [qId]: {
+          ...oldQState,
+          status: 'unanswered',
+          selected_answer: null,
+        }
+      }
+    })
+  }
+
+  const handleAnswerChange = (selectedOption: any) => {
+    const qId = questions[currentQuestionIndex].question_id
+    const newStatus: AnswerStatus = (selectedOption !== null && selectedOption !== '') ? 'answered' : 'unanswered' 
+    setTestState(prevState => {
+      const oldQState = prevState[qId] || getQuestionState(qId);
+      return {
+        ...prevState,
+        [qId]: {
+          ...oldQState,
+          selected_answer: selectedOption, 
+          status: newStatus, 
+        }
+      }
+    })
+  }
+
+  const jumpToQuestion = (index: number) => {
+    navigateToQuestion(index)
+  }
+
+  // --- SUBMIT FUNCTION (Redirects to Report) ---
+  const handleSubmitTest = async () => {
+    if (isSubmitting) return
+    
+    const confirmSubmit = window.confirm('Are you sure you want to submit the test?')
+    if (!confirmSubmit) {
+      return
+    }
+
+    setIsSubmitting(true)
+    
+    // 1. Final save of the current question
+    const currentQId = questions[currentQuestionIndex].question_id
+    await saveAnswerToDB(currentQId) 
+
+    // 2. Update the User_Test_Attempts table
+    const { error } = await supabase
+      .from('User_Test_Attempts')
+      .update({
+        status: 'COMPLETED',
+        end_time: new Date().toISOString(),
+      })
+      .eq('attempt_id', attemptId)
+
+    if (error) {
+      console.error('Error submitting test:', error)
+      alert('There was an error submitting your test. Please try again.')
+      setIsSubmitting(false)
+      return
+    }
+    
+    // 3. Redirect to the report page
+    router.push(`/report/${attemptId}`)
+  }
+
+  // --- Helper to format timer ---
+  const formatTime = (seconds: number) => {
+    const h = Math.floor(seconds / 3600).toString().padStart(2, '0')
+    const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0')
+    const s = (seconds % 60).toString().padStart(2, '0')
+    return `${h}:${m}:${s}`
+  }
+  
   // --- Render Logic ---
   if (loading) {
     return (
-      <div className="flex flex-col justify-center items-center min-h-screen">
-        <Spinner />
-        <p className="ml-4 text-lg mt-4">Generating your report...</p>
-      </div>
-    )
-  }
-
-  if (error) {
-    return (
       <div className="flex justify-center items-center min-h-screen">
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded" role="alert">
-          <strong className="font-bold">Error: </strong>
-          <span className="block sm:inline">{error}</span>
-        </div>
+        <Spinner />
+        <p className="ml-4 text-lg">Loading your test...</p>
       </div>
     )
   }
 
-  if (!reportData) {
-    return <div>No report data found.</div>
+  if (questions.length === 0) {
+    return <div>Error: No questions found for this test.</div>
   }
 
-  const filteredQuestions = reportData.questions.filter(q => {
-    if (activeTab === 'ALL') return true
-    return q.status === activeTab
-  })
+  const currentQuestion = questions[currentQuestionIndex]
+  const currentQState = getQuestionState(currentQuestion.question_id)
 
   return (
-    <div className="min-h-screen bg-gray-50 p-8">
-      <header className="flex justify-between items-center mb-8">
-        <h1 className="text-3xl font-bold">{reportData.testName} - Report</h1>
+    <div className="flex flex-col h-screen">
+      {/* --- 1. Header --- */}
+      <header className="flex justify-between items-center p-4 bg-gray-800 text-white shadow-md">
+        <h1 className="text-xl font-bold">MVP Sample Test</h1>
+        <div className="text-lg font-mono bg-white text-gray-800 px-4 py-2 rounded">
+          Time Left: {formatTime(timeLeft)}
+        </div>
         <button
-          onClick={() => router.push('/dashboard')}
-          className="bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600"
+          onClick={handleSubmitTest}
+          disabled={isSubmitting}
+          className="bg-green-500 hover:bg-green-600 text-white px-6 py-2 rounded-lg disabled:bg-gray-400"
         >
-          Back to Dashboard
+          {isSubmitting ? 'Submitting...' : 'Submit Test'}
         </button>
       </header>
 
-      {/* --- Section 1: Overall Performance --- */}
-      <div className="mb-8 p-6 bg-white rounded-lg shadow-md">
-        <h2 className="text-2xl font-semibold mb-4">Overall Performance</h2>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
-          <div className="p-4 bg-blue-100 rounded-lg">
-            <div className="text-3xl font-bold text-blue-800">{reportData.totalScore}</div>
-            <div className="text-sm text-gray-600">Total Score</div>
-          </div>
-          <div className="p-4 bg-green-100 rounded-lg">
-            <div className="text-3xl font-bold text-green-800">{reportData.totalCorrect}</div>
-            <div className="text-sm text-gray-600">Correct</div>
-          </div>
-          <div className="p-4 bg-red-100 rounded-lg">
-            <div className="text-3xl font-bold text-red-800">{reportData.totalIncorrect}</div>
-            <div className="text-sm text-gray-600">Incorrect</div>
-          </div>
-          <div className="p-4 bg-gray-100 rounded-lg">
-            <div className="text-3xl font-bold text-gray-800">{reportData.totalUnattempted}</div>
-            <div className="text-sm text-gray-600">Unattempted</div>
-          </div>
-        </div>
-      </div>
-
-      {/* --- Section 2: Subject-wise Breakdown --- */}
-      <div className="mb-8 p-6 bg-white rounded-lg shadow-md">
-        <h2 className="text-2xl font-semibold mb-4">Subject-wise Breakdown</h2>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left min-w-max">
-            <thead className="bg-gray-100">
-              <tr>
-                <th className="p-4">Subject</th>
-                <th className="p-4">Score</th>
-                <th className="p-4">Correct</th>
-                <th className="p-4">Incorrect</th>
-                <th className="p-4">Unattempted</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(reportData.subjectStats).map(([subject, stats]) => (
-                <tr key={subject} className="border-b">
-                  <td className="p-4 font-medium">{subject}</td>
-                  <td className="p-4 font-bold">{stats.score}</td>
-                  <td className="p-4 text-green-600">{stats.correct}</td>
-                  <td className="p-4 text-red-600">{stats.incorrect}</td>
-                  <td className="p-4 text-gray-600">{stats.unattempted}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* --- Section 3: Solution Review --- */}
-      <div className="p-6 bg-white rounded-lg shadow-md">
-        <h2 className="text-2xl font-semibold mb-4">Solution Review</h2>
-        <div className="border-b border-gray-200 mb-4">
-          <nav className="flex space-x-4 overflow-x-auto">
-            {(['ALL', 'CORRECT', 'INCORRECT', 'UNATTEMPTED'] as ReportTab[]).map(tab => (
-              <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
-                className={`py-2 px-4 font-medium whitespace-nowrap ${
-                  activeTab === tab 
-                  ? 'border-b-2 border-blue-500 text-blue-600' 
-                  : 'text-gray-500 hover:text-gray-700'
-                }`}
-              >
-                {tab}
-              </button>
-            ))}
-          </nav>
-        </div>
+      {/* --- 2. Main Content (Test UI) --- */}
+      <div className="flex flex-1 overflow-hidden">
         
-        {/* Question List */}
-        <div className="space-y-6">
-          {filteredQuestions.length > 0 ? (
-            filteredQuestions.map(q => (
-              <QuestionReviewCard key={q.question_id} question={q} />
-            ))
-          ) : (
-            <p className="text-gray-600">No questions in this category.</p>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
+        {/* --- 2A. Left/Main Question Area --- */}
+        <div className="flex-1 flex flex-col p-6 overflow-y-auto">
+          <div className="bg-white p-6 rounded-lg shadow-lg flex-1">
+            <h2 className="text-xl font-semibold mb-4">
+              Question {currentQuestion.question_number}
+            </h2>
+            
+            <div className="text-lg mb-6 prose">
+              {currentQuestion.question_text}
+            </div>
 
-// --- Internal Component for displaying a single question review ---
-function QuestionReviewCard({ question }: { question: QuestionAnalysis }) {
-  const [showSolution, setShowSolution] = useState(false)
+            {currentQuestion.question_image_url && (
+              <img src={currentQuestion.question_image_url} alt="Question" className="mb-6" />
+            )}
 
-  const getAnswerDisplay = (answer: any) => {
-    if (answer === null || answer === undefined || answer === "") return 'Not Answered'
-    if (typeof answer === 'number' || !isNaN(parseFloat(answer))) {
-        return String(parseFloat(answer))
-    }
-    if (Array.isArray(answer)) return answer.join(', ')
-    return String(answer)
-  }
-  
-  const getCorrectAnswerDisplay = (answer: any) => {
-    if (answer === null || answer === undefined) return 'N/A'
-    if (Array.isArray(answer)) {
-        return answer.map(a => getAnswerDisplay(a)).join(', ')
-    }
-    return getAnswerDisplay(answer)
-  }
+            {/* --- Options --- */}
+            <div className="space-y-4">
+              {currentQuestion.question_type === 'SINGLE_CHOICE' && currentQuestion.options && (
+                currentQuestion.options.map(option => (
+                  <label key={option.id} className="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50">
+                    <input
+                      type="radio"
+                      name={`question_${currentQuestion.question_id}`}
+                      className="h-5 w-5 text-blue-600"
+                      value={option.id}
+                      checked={currentQState.selected_answer === option.id}
+                      onChange={() => handleAnswerChange(option.id)}
+                    />
+                    <span className="ml-4 text-lg">{option.text}</span>
+                  </label>
+                ))
+              )}
 
-  const isCorrect = question.status === 'CORRECT'
-
-  return (
-    <div className="border border-gray-200 rounded-lg p-6">
-      <h3 className="font-semibold text-lg mb-4">
-        Question {question.question_number} ({question.subject})
-      </h3>
-      <div className="prose mb-4">{question.question_text}</div>
-
-      <div className="space-y-2 mb-4">
-        <div className={`p-3 rounded ${
-          isCorrect ? 'bg-green-100' : 'bg-red-100'
-        }`}>
-          <span className="font-semibold">Your Answer: </span>
-          <span className={isCorrect ? 'text-green-700' : 'text-red-700'}>
-            {getAnswerDisplay(question.selected_answer)}
-          </span>
-        </div>
-        {!isCorrect && (
-          <div className="p-3 rounded bg-green-100">
-            <span className="font-semibold">Correct Answer: </span>
-            <span className="text-green-700">
-              {getCorrectAnswerDisplay(question.correct_answer)}
-            </span>
+              {currentQuestion.question_type === 'NUMERICAL' && (
+                <input
+                  type="number"
+                  step="any"
+                  className="w-full p-4 border rounded-lg text-lg"
+                  placeholder="Enter your numerical answer"
+                  value={currentQState.selected_answer || ''}
+                  onChange={(e) => handleAnswerChange(e.target.value)}
+                />
+              )}
+            </div>
           </div>
-        )}
-      </div>
-
-      <button
-        onClick={() => setShowSolution(!showSolution)}
-        className="text-blue-600 hover:underline"
-      >
-        {showSolution ? 'Hide Solution' : 'Show Solution'}
-      </button>
-
-      {showSolution && (
-        <div className="mt-4 pt-4 border-t border-gray-200 prose">
-          <h4 className="font-semibold">Solution:</h4>
-          <p>{question.solution_text || 'No solution provided.'}</p>
+          
+          {/* --- Bottom Navigation Bar --- */}
+          <div className="flex justify-between items-center pt-6">
+            <button
+              onClick={handleMarkForReview}
+              className="bg-purple-500 hover:bg-purple-600 text-white px-6 py-3 rounded-lg"
+            >
+              Mark for Review & Next
+            </button>
+            <button
+              onClick={handleClearResponse}
+              className="bg-gray-500 hover:bg-gray-600 text-white px-6 py-3 rounded-lg"
+            >
+              Clear Response
+            </button>
+            <button
+              onClick={handleSaveAndNext}
+              className="bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 rounded-lg"
+            >
+              Save & Next
+            </button>
+          </div>
         </div>
-      )}
+
+        {/* --- 2B. Right Question Palette --- */}
+        <div className="w-1/4 bg-gray-100 p-6 overflow-y-auto border-l">
+          <h3 className="text-lg font-semibold mb-4 text-center">Question Palette</h3>
+          <div className="grid grid-cols-5 gap-2">
+            {questions.map((q, index) => {
+              const state = getQuestionState(q.question_id)
+              
+              let bgColor = 'bg-gray-300' // 'not_visited'
+              if (state.status === 'answered') bgColor = 'bg-green-500'
+              if (state.status === 'unanswered') bgColor = 'bg-red-500'
+              if (state.status === 'marked_for_review') bgColor = 'bg-purple-500'
+              
+              const isCurrent = index === currentQuestionIndex
+              const border = isCurrent ? 'border-4 border-blue-500' : 'border-2 border-transparent'
+
+              return (
+                <button
+                  key={q.question_id}
+                  onClick={() => jumpToQuestion(index)}
+                  className={`flex items-center justify-center w-12 h-12 rounded-lg text-white font-bold ${bgColor} ${border}`}
+                >
+                  {q.question_number}
+                </button>
+              )
+            })}
+          </div>
+          
+          <div className="mt-8 space-y-2">
+            <div className="flex items-center"><span className="w-5 h-5 bg-green-500 rounded-full mr-2"></span> Answered</div>
+            <div className="flex items-center"><span className="w-5 h-5 bg-red-500 rounded-full mr-2"></span> Unanswered</div>
+            <div className="flex items-center"><span className="w-5 h-5 bg-purple-500 rounded-full mr-2"></span> Marked for Review</div>
+            <div className="flex items-center"><span className="w-5 h-5 bg-gray-300 rounded-full mr-2"></span> Not Visited</div>
+            <div className="flex items-center"><span className="w-12 h-12 rounded-lg border-4 border-blue-500 mr-2 text-sm text-center"></span> Current</div>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
